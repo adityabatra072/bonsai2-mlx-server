@@ -299,7 +299,13 @@ def _chat_completions(body: dict):
     def event_stream():
         try:
             while True:
-                kind = itemq.get(timeout=3600)
+                try:
+                    kind = itemq.get(timeout=20)
+                except _queue.Empty:
+                    # prefill/decode can run minutes without emitting;
+                    # keep SSE alive so clients never chunk-timeout.
+                    yield ": working\n\n"
+                    continue
                 if kind[0] == "delta":
                     yield ("data: " + json.dumps(
                         {"id": rid, "object": "chat.completion.chunk",
