@@ -70,7 +70,7 @@ opencode (`~/.config/opencode/opencode.jsonc`):
     "limit": {"context": 8192, "output": 4096}}}}}
 ```
 
-Notes for coding: thinking tokens count into `max_tokens`, so keep it generous (4096); `medium` effort is the speed/quality sweet spot; tool calls work end to end.
+Notes for coding: thinking tokens count into `max_tokens`, so keep it generous (4096); the server defaults to `medium` effort (override per request with `reasoning_effort`); tool calls work end to end. Turn 1 carries opencode's full tool schemas (~12k tokens ≈ 6 min prefill on a base M4) — that is the hardware wall, not the server; follow-up turns hit the prefix cache. Either backend fits 16 GB, but not both at once.
 
 ## Tests
 
