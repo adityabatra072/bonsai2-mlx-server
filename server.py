@@ -62,8 +62,10 @@ template = (PACK / "chat_template.jinja").read_text()
 base_config = chat_config(model_config)
 print(f"[bonsai] ready in {time.time()-t0:.0f}s", flush=True)
 
-from mlx_vlm.generate.ar import generate_step
-from mlx_vlm.models import cache as cache_mod
+import queue as _queue
+from worker import start_worker
+
+jobq = start_worker(model, processor)
 
 lock = threading.Lock()
 _stats = {"requests": 0, "cache_hits": 0, "cache_hit_tokens": 0,
@@ -166,7 +168,6 @@ def to_template_tools(tools):
         for t in tools if t.get("type", "function") == "function"]
 
 
-from snaplib import snap_cache
 
 
 def find_slot(tokens):
@@ -183,92 +184,6 @@ def find_slot(tokens):
               flush=True)
         return best, best_n
     return None, 0
-
-
-def prefill_only(tokens_in, cache_obj, params):
-    """Forward pass only (no sampling); leaves cache at input boundary."""
-    gen = generate_step(
-        mx.array([tokens_in], dtype=mx.int32), model, None, None,
-        max_tokens=0,
-        temperature=params["temperature"],
-        top_p=params.get("top_p", 0.8),
-        top_k=params.get("top_k", 20),
-        prompt_cache=cache_obj,
-        verbose=False)
-    for _ in gen:
-        pass
-    mx.eval([c.state for c in cache_obj])
-
-
-def generate_from(tokens_in, cache_obj, params):
-    """Generate from already-prefilled cache; returns (text, ids, finish)."""
-    detok = processor.detokenizer
-    detok.reset()
-    gen = generate_step(
-        mx.array([tokens_in], dtype=mx.int32), model, None, None,
-        max_tokens=params["max_tokens"],
-        temperature=params["temperature"],
-        top_p=params.get("top_p", 0.8),
-        top_k=params.get("top_k", 20),
-        prompt_cache=cache_obj,
-        verbose=False)
-    text, n, out_ids = "", 0, []
-    for tok, _ in gen:
-        detok.add_token(tok)
-        text = detok.text
-        out_ids.append(tok)
-        n += 1
-    return text, out_ids, "length" if n >= params["max_tokens"] else "stop"
-
-
-def run_generation(tokens, params, cache_obj, start):
-    """Two-phase: prefill suffix (snapshot the boundary), then generate.
-
-    Returns (text, gen_ids, finish, snap_cache, snap_tokens).
-    """
-    suffix = tokens[start:]
-    assert len(suffix) >= 1
-    if len(suffix) == 1:
-        text, out_ids, finish = generate_from(suffix, cache_obj, params)
-        return text, out_ids, finish, None, None
-    prefill_only(suffix[:-1], cache_obj, params)
-    snap_c = snap_cache(cache_obj)
-    snap_t = list(tokens[:len(tokens) - 1])
-    text, out_ids, finish = generate_from([suffix[-1]], cache_obj, params)
-    return text, out_ids, finish, snap_c, snap_t
-
-
-def run_stream(tokens, params, cache_obj, start):
-    suffix = tokens[start:]
-    assert len(suffix) >= 1
-    if len(suffix) == 1:
-        snap_c, snap_t = None, None
-        first = suffix
-    else:
-        prefill_only(suffix[:-1], cache_obj, params)
-        snap_c = snap_cache(cache_obj)
-        snap_t = list(tokens[:len(tokens) - 1])
-        first = [suffix[-1]]
-    detok = processor.detokenizer
-    detok.reset()
-    gen = generate_step(
-        mx.array([first], dtype=mx.int32), model, None, None,
-        max_tokens=params["max_tokens"],
-        temperature=params["temperature"],
-        top_p=params.get("top_p", 0.8),
-        top_k=params.get("top_k", 20),
-        prompt_cache=cache_obj,
-        verbose=False)
-    sent, n, out_ids = "", 0, []
-    for tok, _ in gen:
-        detok.add_token(tok)
-        cur = detok.text
-        delta = cur[len(sent):]
-        sent = cur
-        out_ids.append(tok)
-        n += 1
-        yield delta, False, None, None
-    yield sent, True, out_ids, (snap_c, snap_t)
 
 
 app = FastAPI(title="bonsai2-mlx-server")
@@ -289,111 +204,120 @@ def health():
 
 @app.post("/v1/chat/completions")
 def chat_completions(body: dict):
-    # MLX streams are thread-local: uvicorn runs us in a worker thread,
-    # so bind a fresh GPU stream for the whole request.
-    with mx.stream(mx.new_stream(mx.gpu)):
+    # Single-flight: the worker thread serializes generation, and slot
+    # metadata must not change under a running job.
+    with lock:
         return _chat_completions(body)
 
 
+def _drain(itemq, timeout=3600):
+    """Collect a non-streamed job result (raises on worker error)."""
+    text, finish, snap = "", "stop", (None, None)
+    while True:
+        kind = itemq.get(timeout=timeout)
+        if kind[0] == "delta":
+            continue  # non-streamed: only the final text matters
+        if kind[0] == "done":
+            _, text, finish, snap_c, snap_t = kind
+            return text, finish, snap_c, snap_t
+        raise kind[1]
+
+
 def _chat_completions(body: dict):
-    with lock:
-        _stats["requests"] += 1
-        messages = body.get("messages", [])
-        tools = to_template_tools(body.get("tools"))
-        enable_thinking = body.get("enable_thinking", True)
-        reasoning_effort = body.get("reasoning_effort", "xhigh")
-        params = {
-            "max_tokens": body.get("max_tokens", 4096),
-            "temperature": body.get("temperature", 0.7),
-            "top_p": body.get("top_p", 0.8),
-            "top_k": body.get("top_k", 20),
-        }
-        stream = body.get("stream", False)
+    _stats["requests"] += 1
+    messages = body.get("messages", [])
+    tools = to_template_tools(body.get("tools"))
+    enable_thinking = body.get("enable_thinking", True)
+    reasoning_effort = body.get("reasoning_effort", "xhigh")
+    params = {
+        "max_tokens": body.get("max_tokens", 4096),
+        "temperature": body.get("temperature", 0.7),
+        "top_p": body.get("top_p", 0.8),
+        "top_k": body.get("top_k", 20),
+    }
+    stream = body.get("stream", False)
 
-        prompt_text = render(to_template_messages(messages), tools,
-                             enable_thinking, reasoning_effort)
-        tokens = encode(prompt_text)
-        _stats["prefill_tokens"] += len(tokens)
+    prompt_text = render(to_template_messages(messages), tools,
+                         enable_thinking, reasoning_effort)
+    tokens = encode(prompt_text)
+    _stats["prefill_tokens"] += len(tokens)
 
-        key, hit = find_slot(tokens)
-        if key is not None:
-            slot = _slots.pop(key)
-            _slots[key] = slot  # MRU
-            # copy: the stored snapshot must stay pristine
-            cache_obj, start = snap_cache(slot["cache"]), hit
-            _stats["cache_hits"] += 1
-            _stats["cache_hit_tokens"] += hit
-        else:
-            print("[cache] miss "
-                  f"prompt={len(tokens)} slots={len(_slots)}", flush=True)
-            cache_obj = cache_mod.make_prompt_cache(model.language_model)
-            start = 0
-            lm = model.language_model
-            lm._position_ids = None
-            lm._rope_deltas = None
+    key, hit = find_slot(tokens)
+    if key is not None:
+        slot = _slots.pop(key)
+        _slots[key] = slot  # MRU
+        job_cache, start = slot["cache"], hit
+        _stats["cache_hits"] += 1
+        _stats["cache_hit_tokens"] += hit
+    else:
+        print("[cache] miss "
+              f"prompt={len(tokens)} slots={len(_slots)}", flush=True)
+        job_cache, start = None, 0
 
-        def store_slot(snap_cache_obj, snap_tokens):
-            if snap_cache_obj is None or not snap_tokens:
-                return
-            slot_key = f"{abs(hash(tuple(tokens[:32]))):x}"
-            _slots[slot_key] = {"tokens": list(snap_tokens),
-                                "cache": snap_cache_obj}
-            while len(_slots) > MAX_SLOTS:
-                _slots.popitem(last=False)
+    def store_slot(snap_cache_obj, snap_tokens):
+        if snap_cache_obj is None or not snap_tokens:
+            return
+        slot_key = f"{abs(hash(tuple(tokens[:32]))):x}"
+        _slots[slot_key] = {"tokens": list(snap_tokens),
+                            "cache": snap_cache_obj}
+        while len(_slots) > MAX_SLOTS:
+            _slots.popitem(last=False)
 
-        created = int(time.time())
-        rid = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    created = int(time.time())
+    rid = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    itemq = _queue.Queue()
+    jobq.put((tokens, start, params, job_cache, itemq))
 
-        if not stream:
-            text, gen_ids, finish, snap_c, snap_t = run_generation(
-                tokens, params, cache_obj, start)
-            content, reasoning, calls = parse_output(text)
-            if calls and body.get("tools"):
-                finish = "tool_calls"
-            store_slot(snap_c, snap_t)
-            msg = {"role": "assistant", "content": content or None}
-            if reasoning:
-                msg["reasoning_content"] = reasoning
-            if calls:
-                msg["tool_calls"] = calls
-            return {"id": rid, "object": "chat.completion",
-                    "created": created, "model": MODEL_ID,
-                    "choices": [{"index": 0, "message": msg,
-                                 "finish_reason": finish}],
-                    "usage": {"prompt_tokens": len(tokens),
-                              "completion_tokens": len(encode(text)),
-                              "total_tokens": len(tokens) + len(encode(text))}}
+    if not stream:
+        text, finish, snap_c, snap_t = _drain(itemq)
+        content, reasoning, calls = parse_output(text)
+        if calls and body.get("tools"):
+            finish = "tool_calls"
+        store_slot(snap_c, snap_t)
+        msg = {"role": "assistant", "content": content or None}
+        if reasoning:
+            msg["reasoning_content"] = reasoning
+        if calls:
+            msg["tool_calls"] = calls
+        return {"id": rid, "object": "chat.completion",
+                "created": created, "model": MODEL_ID,
+                "choices": [{"index": 0, "message": msg,
+                             "finish_reason": finish}],
+                "usage": {"prompt_tokens": len(tokens),
+                          "completion_tokens": len(encode(text)),
+                          "total_tokens": len(tokens) + len(encode(text))}}
 
-        def event_stream():
-            # StreamingResponse drains this generator after the endpoint
-            # returns (different thread) — bind the GPU stream here.
-            with mx.stream(mx.new_stream(mx.gpu)):
-                for delta, done, gen_ids, snap_pair in run_stream(
-                            tokens, params, cache_obj, start):
-                    if not done:
-                        yield ("data: " + json.dumps(
-                            {"id": rid, "object": "chat.completion.chunk",
-                             "created": created, "model": MODEL_ID,
-                             "choices": [{"index": 0,
-                                          "delta": {"content": delta},
-                                          "finish_reason": None}]}) + "\n\n")
-                    else:
-                        content, reasoning, calls = parse_output(delta)
-                        msg = {"role": "assistant", "content": content or None}
-                        if reasoning:
-                            msg["reasoning_content"] = reasoning
-                        if calls and body.get("tools"):
-                            msg["tool_calls"] = calls
-                            finish = "tool_calls"
-                        else:
-                            finish = "stop"
-                        snap_c, snap_t = snap_pair
-                        store_slot(snap_c, snap_t)
-                        yield ("data: " + json.dumps(
-                            {"id": rid, "object": "chat.completion.chunk",
-                             "created": created, "model": MODEL_ID,
-                             "choices": [{"index": 0, "delta": msg,
-                                          "finish_reason": finish}]}) + "\n\n")
-                        yield "data: [DONE]\n\n"
-        return StreamingResponse(event_stream(),
-                                 media_type="text/event-stream")
+    def event_stream():
+        try:
+            while True:
+                kind = itemq.get(timeout=3600)
+                if kind[0] == "delta":
+                    yield ("data: " + json.dumps(
+                        {"id": rid, "object": "chat.completion.chunk",
+                         "created": created, "model": MODEL_ID,
+                         "choices": [{"index": 0,
+                                      "delta": {"content": kind[1]},
+                                      "finish_reason": None}]}) + "\n\n")
+                elif kind[0] == "done":
+                    _, text, finish, snap_c, snap_t = kind
+                    content, reasoning, calls = parse_output(text)
+                    msg = {"role": "assistant", "content": content or None}
+                    if reasoning:
+                        msg["reasoning_content"] = reasoning
+                    if calls and body.get("tools"):
+                        msg["tool_calls"] = calls
+                        finish = "tool_calls"
+                    store_slot(snap_c, snap_t)
+                    yield ("data: " + json.dumps(
+                        {"id": rid, "object": "chat.completion.chunk",
+                         "created": created, "model": MODEL_ID,
+                         "choices": [{"index": 0, "delta": msg,
+                                      "finish_reason": finish}]}) + "\n\n")
+                    yield "data: [DONE]\n\n"
+                    return
+                else:
+                    raise kind[1]
+        except Exception as e:  # noqa: BLE001
+            yield ("data: " + json.dumps({"error": str(e)}) + "\n\n")
+    return StreamingResponse(event_stream(),
+                             media_type="text/event-stream")
