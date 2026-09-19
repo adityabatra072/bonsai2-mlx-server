@@ -242,6 +242,13 @@ def _chat_completions(body: dict):
     tokens = encode(prompt_text)
     _stats["prefill_tokens"] += len(tokens)
 
+    if os.environ.get("BONSAI_DEBUG_BODY") == "1":
+        import hashlib as _hl
+        _bd = Path("/tmp/bonsai-bodies")
+        _bd.mkdir(exist_ok=True)
+        (_bd / f"{int(time.time()*1000)}.json").write_text(json.dumps(body)[:200000])
+        print(f"[dbg] prompt={len(tokens)} head={_hl.md5(str(tokens[:64]).encode()).hexdigest()[:8]}",
+              flush=True)
     key, hit = find_slot(tokens)
     if key is not None:
         slot = _slots.pop(key)
