@@ -228,7 +228,7 @@ def _chat_completions(body: dict):
     messages = body.get("messages", [])
     tools = to_template_tools(body.get("tools"))
     enable_thinking = body.get("enable_thinking", True)
-    reasoning_effort = body.get("reasoning_effort", "xhigh")
+    reasoning_effort = body.get("reasoning_effort", "medium")
     params = {
         "max_tokens": body.get("max_tokens", 4096),
         "temperature": body.get("temperature", 0.7),
