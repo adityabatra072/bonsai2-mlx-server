@@ -255,6 +255,8 @@ def _chat_completions(body: dict):
         job_cache, start = None, 0
 
     def store_slot(snap_cache_obj, snap_tokens):
+        print(f"[store] snap={'Y' if snap_cache_obj is not None else 'N'} "
+              f"ntok={len(snap_tokens) if snap_tokens else 0}", flush=True)
         if snap_cache_obj is None or not snap_tokens:
             return
         slot_key = f"{abs(hash(tuple(tokens[:32]))):x}"
