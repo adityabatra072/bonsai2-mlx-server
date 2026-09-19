@@ -289,6 +289,13 @@ def health():
 
 @app.post("/v1/chat/completions")
 def chat_completions(body: dict):
+    # MLX streams are thread-local: uvicorn runs us in a worker thread,
+    # so bind a fresh GPU stream for the whole request.
+    with mx.stream(mx.new_stream(mx.gpu)):
+        return _chat_completions(body)
+
+
+def _chat_completions(body: dict):
     with lock:
         _stats["requests"] += 1
         messages = body.get("messages", [])
@@ -358,32 +365,35 @@ def chat_completions(body: dict):
                               "total_tokens": len(tokens) + len(encode(text))}}
 
         def event_stream():
-            for delta, done, gen_ids, snap_pair in run_stream(
-                    tokens, params, cache_obj, start):
-                if not done:
-                    yield ("data: " + json.dumps(
-                        {"id": rid, "object": "chat.completion.chunk",
-                         "created": created, "model": MODEL_ID,
-                         "choices": [{"index": 0,
-                                      "delta": {"content": delta},
-                                      "finish_reason": None}]}) + "\n\n")
-                else:
-                    content, reasoning, calls = parse_output(delta)
-                    msg = {"role": "assistant", "content": content or None}
-                    if reasoning:
-                        msg["reasoning_content"] = reasoning
-                    if calls and body.get("tools"):
-                        msg["tool_calls"] = calls
-                        finish = "tool_calls"
+            # StreamingResponse drains this generator after the endpoint
+            # returns (different thread) — bind the GPU stream here.
+            with mx.stream(mx.new_stream(mx.gpu)):
+                for delta, done, gen_ids, snap_pair in run_stream(
+                            tokens, params, cache_obj, start):
+                    if not done:
+                        yield ("data: " + json.dumps(
+                            {"id": rid, "object": "chat.completion.chunk",
+                             "created": created, "model": MODEL_ID,
+                             "choices": [{"index": 0,
+                                          "delta": {"content": delta},
+                                          "finish_reason": None}]}) + "\n\n")
                     else:
-                        finish = "stop"
-                    snap_c, snap_t = snap_pair
-                    store_slot(snap_c, snap_t)
-                    yield ("data: " + json.dumps(
-                        {"id": rid, "object": "chat.completion.chunk",
-                         "created": created, "model": MODEL_ID,
-                         "choices": [{"index": 0, "delta": msg,
-                                      "finish_reason": finish}]}) + "\n\n")
-                    yield "data: [DONE]\n\n"
+                        content, reasoning, calls = parse_output(delta)
+                        msg = {"role": "assistant", "content": content or None}
+                        if reasoning:
+                            msg["reasoning_content"] = reasoning
+                        if calls and body.get("tools"):
+                            msg["tool_calls"] = calls
+                            finish = "tool_calls"
+                        else:
+                            finish = "stop"
+                        snap_c, snap_t = snap_pair
+                        store_slot(snap_c, snap_t)
+                        yield ("data: " + json.dumps(
+                            {"id": rid, "object": "chat.completion.chunk",
+                             "created": created, "model": MODEL_ID,
+                             "choices": [{"index": 0, "delta": msg,
+                                          "finish_reason": finish}]}) + "\n\n")
+                        yield "data: [DONE]\n\n"
         return StreamingResponse(event_stream(),
                                  media_type="text/event-stream")
